@@ -1,16 +1,14 @@
 import os
 import json
+import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-from google import genai
-from google.genai import types
 
 app = FastAPI()
 
-# Rule 4: CORS must be enabled
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,17 +16,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Gemini Client
-api_key = os.getenv("GEMINI_API_KEY")
-if not api_key:
-    raise ValueError("GEMINI_API_KEY environment variable is missing.")
-client = genai.Client(api_key=api_key)
-
-# API Spec Input: {"invoice_text": "..."}
 class InvoiceRequest(BaseModel):
     invoice_text: str
 
-# API Spec Output: Exact 6 keys. Optional ensures 'null' is used if missing (Rule 1).
 class InvoiceExtraction(BaseModel):
     invoice_no: Optional[str] = None
     date: Optional[str] = None
@@ -38,8 +28,24 @@ class InvoiceExtraction(BaseModel):
     currency: Optional[str] = None
 
 @app.post("/extract", response_model=InvoiceExtraction)
-async def extract_invoice_data(payload: InvoiceRequest):
-    # Enforcing Rules 2 and 3 through strict system prompting
+def extract_invoice_data(payload: InvoiceRequest):
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY missing in Render")
+
+    # Fixed schema required by the problem statement
+    invoice_schema = {
+        "type": "OBJECT",
+        "properties": {
+            "invoice_no": {"type": "STRING"},
+            "date": {"type": "STRING"},
+            "vendor": {"type": "STRING"},
+            "amount": {"type": "NUMBER"},
+            "tax": {"type": "NUMBER"},
+            "currency": {"type": "STRING"}
+        }
+    }
+
     system_instruction = (
         "You are an expert invoice data extractor. Extract the details from the provided raw text.\n"
         "CRITICAL RULES:\n"
@@ -50,25 +56,49 @@ async def extract_invoice_data(payload: InvoiceRequest):
         "5. If a field cannot be found in the text, you must omit it so it returns null."
     )
 
+    url = "https://aipipe.org/geminiv1beta/models/gemini-2.5-flash:generateContent"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    payload_data = {
+        "systemInstruction": {
+            "parts": [{"text": system_instruction}]
+        },
+        "contents": [
+            {
+                "parts": [{"text": payload.invoice_text}]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.0,
+            "responseMimeType": "application/json",
+            "responseSchema": invoice_schema
+        }
+    }
+
     try:
-        # Using Structured Outputs to guarantee the exact JSON format
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=payload.invoice_text,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=InvoiceExtraction,
-                system_instruction=system_instruction,
-                temperature=0.0 # Keep it deterministic 
-            )
-        )
+        response = requests.post(url, headers=headers, json=payload_data)
+        response.raise_for_status() 
         
-        # Parse the guaranteed JSON string from Gemini and return it
-        extracted_data = json.loads(response.text)
-        return extracted_data
+        data = response.json()
+        raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        
+        # Strip markdown in case Gemini hallucinates backticks
+        if raw_text.startswith("```"):
+            raw_text = raw_text.split("\n", 1)[-1]
+        if raw_text.endswith("```"):
+            raw_text = raw_text.rsplit("\n", 1)[0]
+            
+        return json.loads(raw_text.strip())
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = str(e)
+        if isinstance(e, requests.exceptions.HTTPError):
+            error_msg += f" - Response Text: {response.text}"
+        print(f"CRITICAL EXTRACTION ERROR: {error_msg}")
+        raise HTTPException(status_code=500, detail=error_msg)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
